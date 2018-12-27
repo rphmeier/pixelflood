@@ -41,20 +41,20 @@ fn chunkify_square(x: u32, y: u32, size: u32, rgb: u32, n: u32) -> Vec<Vec<u8>> 
     }).collect()
 }
 
-fn chunkify_image(path: &str, n: u32) -> Vec<Vec<u8>> {
+fn chunkify_image(x: u32, y: u32, path: &str, n: u32) -> Vec<Vec<u8>> {
     use std::fmt::Write as WriteFmt;
     
-    let mut tiny = image::open(path).unwrap().to_rgb();
+    let mut tiny = image::open(path).expect("provide valid image").to_rgb();
     
     let w = tiny.width();
     let h = tiny.height();
     
     let mut cmds = Vec::new();
-    for x in 0..w {
-        for y in 0..h {
-            let pixel = tiny.get_pixel(x, y);
+    for px_x in 0..w {
+        for px_y in 0..h {
+            let pixel = tiny.get_pixel(px_x, px_y);
             
-            let cmd = format!("PX {} {} {:02X}{:02X}{:02X}\n", x, y, pixel.data[0], pixel.data[1], pixel.data[2]);
+            let cmd = format!("PX {} {} {:02X}{:02X}{:02X}\n", x + px_x, y + px_y, pixel.data[0], pixel.data[1], pixel.data[2]);
             cmds.push(cmd);
         }
     }
@@ -101,6 +101,8 @@ struct Worker {
 }
 
 fn main() {
+    let img_path = std::env::var("IMG_PATH").expect("Set IMG_PATH env var");
+
     let mut workers = Vec::new();
     
     for i in 0..THREADS {
@@ -115,8 +117,8 @@ fn main() {
         workers.push(Worker { commands: tx, join_handle });
     }
     
-    let chunks = chunkify_image("/Users/pepyakin/Downloads/2018-12-27 18.25.20.jpg", 16);
-    for (i, chunk) in chunks.into_iter().enumerate() {
+    let chunks = chunkify_image(400, 200, img_path.as_str(), THREADS);
+    for (i, chunk) in chunks.into_iter().enumerate().take(THREADS as _) {
         let _ = workers[i].commands.send(Work(chunk));
     }
     
