@@ -1,5 +1,6 @@
 use std::net::TcpStream;
 use std::io::{self, Read, Write, BufReader, BufWriter};
+use std::thread;
 
 // production addr.
 const ADDR: &str = "151.217.40.82:1234";
@@ -68,7 +69,7 @@ impl<'a> Remote<'a> {
     }
 }
 
-fn main() {
+fn flooder(offset: u32) {
     let mut stream = TcpStream::connect(ADDR).unwrap();
     let mut remote = Remote::new(&stream);
 
@@ -80,5 +81,18 @@ fn main() {
         }
 
         remote.flush();
+    }
+}
+
+fn main() {
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        handles.push(thread::spawn(|| {
+            flooder(100);
+        }));
+    }
+    
+    for handle in handles {
+        handle.join();
     }
 }
