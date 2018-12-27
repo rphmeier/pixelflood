@@ -5,6 +5,9 @@ use std::thread;
 // production addr.
 const ADDR: &str = "151.217.40.82:1234";
 
+const WIDTH: u32 = 1920;
+const HEIGHT: u32 = 1080;
+
 struct WrappedSlice<'a> {
     inner: &'a mut [u8],
     len: usize,
@@ -76,7 +79,7 @@ fn flooder(offset: u32) {
     loop {
         for i in 0..100 {
             for j in 0..100 {
-                remote.set_pixel(off + i, off + j, 0x00FF00);
+                remote.set_pixel(offset + i, offset + j, 0x00FF00);
             }
         }
 
@@ -87,8 +90,8 @@ fn flooder(offset: u32) {
 fn main() {
     let mut handles = Vec::new();
     for i in 0..10 {
-        handles.push(thread::spawn(|| {
-            flooder(100);
+        handles.push(thread::spawn(move || {
+            flooder(i * 100);
         }));
     }
     
