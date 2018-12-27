@@ -45,7 +45,7 @@ impl<'a> Remote<'a> {
         }
     }
 
-    fn set_offset(&mut self, x: u32, y: u32) {
+    fn set_offset(&mut self, x: u32, y: u32) -> io::Result<()> {
         let mut slice = [0; 32];
         let len = {
             let mut wrapped = WrappedSlice { inner: &mut slice, len: 0 };
@@ -53,10 +53,10 @@ impl<'a> Remote<'a> {
             wrapped.len
         };
 
-        self.output.write(&slice[0..len]).expect("could not write");
+        self.output.write(&slice[0..len]).map(|_| ())
     }
 
-    fn set_pixel(&mut self, x: u32, y: u32, rgb: u32) {
+    fn set_pixel(&mut self, x: u32, y: u32, rgb: u32) -> io::Result<()> {
         let mut slice = [0; 64];
         let len = {
             let mut wrapped = WrappedSlice { inner: &mut slice, len: 0 };
@@ -64,34 +64,36 @@ impl<'a> Remote<'a> {
             wrapped.len
         };
 
-        self.output.write(&slice[0..len]).expect("could not write");
+        self.output.write(&slice[0..len]).map(|_| ())
     }
 
-    fn flush(&mut self) {
-        self.output.flush().unwrap();
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
     }
 }
 
-fn flooder(offset: u32) {
-    let mut stream = TcpStream::connect(ADDR).unwrap();
+fn flooder(off_x: u32, off_y: u32) -> io::Result<()> {
+    let mut stream = TcpStream::connect(ADDR)?;
     let mut remote = Remote::new(&stream);
 
     loop {
         for i in 0..100 {
             for j in 0..100 {
-                remote.set_pixel(offset + i, offset + j, 0x00FF00);
+                remote.set_pixel(off_x + i, off_y + j, 0x00FF00)?;
             }
         }
 
-        remote.flush();
+        remote.flush()?;
     }
 }
 
 fn main() {
     let mut handles = Vec::new();
-    for i in 0..10 {
-        handles.push(thread::spawn(move || {
-            flooder(i * 100);
+    for i in 0..16 {
+        handles.push(thread::spawn(move || loop {
+            if let Err(e) = flooder(i * 100, (i * 100) % 1080) {
+                println!("Restarting thread {}: {:?}", i, e);   
+            }
         }));
     }
     
