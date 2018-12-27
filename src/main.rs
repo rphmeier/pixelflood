@@ -2,34 +2,6 @@ use std::net::TcpStream;
 use std::io::{self, Read, Write, BufReader, BufWriter};
 use std::thread;
 
-// production addr.
-const ADDR: &str = "151.217.40.82:1234";
-
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
-
-struct WrappedSlice<'a> {
-    inner: &'a mut [u8],
-    len: usize,
-}
-
-impl<'a> Write for WrappedSlice<'a> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let size = self.inner.write(buf)?;
-        self.len += size;
-        Ok(size)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-struct Remote<'a> {
-    output: BufWriter<&'a TcpStream>,
-    input: BufReader<&'a TcpStream>,
-}
-
 // Supported commands:
 // send pixel: 'PX {x} {y} {GG or RRGGBB or RRGGBBAA as HEX}\n'
 // set offset for future pixels: 'OFFSET {x} {y}\n'
@@ -37,61 +9,49 @@ struct Remote<'a> {
 // request output resolution: 'SIZE\n'
 // request client connection count: 'CONNECTIONS\n'
 // request help message with all commands: 'HELP\n'
-impl<'a> Remote<'a> {
-    fn new(stream: &'a TcpStream) -> Self {
-        Remote {
-            output: BufWriter::new(stream),
-            input: BufReader::new(stream),
-        }
-    }
 
-    fn set_offset(&mut self, x: u32, y: u32) -> io::Result<()> {
-        let mut slice = [0; 32];
-        let len = {
-            let mut wrapped = WrappedSlice { inner: &mut slice, len: 0 };
-            write!(wrapped, "OFFSET {} {}\n", x, y).expect("greater than 32??");
-            wrapped.len
-        };
+// production addr.
+const ADDR: &str = "151.217.40.82:1234";
 
-        self.output.write(&slice[0..len]).map(|_| ())
-    }
+const WIDTH: u32 = 1920;
+const HEIGHT: u32 = 1080;
 
-    fn set_pixel(&mut self, x: u32, y: u32, rgb: u32) -> io::Result<()> {
-        let mut slice = [0; 64];
-        let len = {
-            let mut wrapped = WrappedSlice { inner: &mut slice, len: 0 };
-            write!(wrapped, "PX {} {} {:06X}\n", x, y, rgb).expect("greater than 64??");
-            wrapped.len
-        };
+fn chunkify_square(x: u32, y: u32, size: u32, rgb: u32, n: u32) -> Vec<Vec<u8>> {
+    let lines_per = size / n;
 
-        self.output.write(&slice[0..len]).map(|_| ())
-    }
+    (0..n).map(|i| {
+        let mut v = Vec::new();
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.output.flush()
-    }
-}
+        let line_off = i*lines_per;
+        println!("Worker {} doing lines {}..{}", i, x + line_off, x + line_off + lines_per - 1);
 
-fn flooder(off_x: u32, off_y: u32) -> io::Result<()> {
-    let mut stream = TcpStream::connect(ADDR)?;
-    let mut remote = Remote::new(&stream);
-
-    loop {
-        for i in 0..100 {
-            for j in 0..100 {
-                remote.set_pixel(off_x + i, off_y + j, 0x00FF00)?;
+        for line in 0..lines_per {
+            for px_y in 0..size {
+                write!(&mut v, "PX {} {} {:06X}\n", x + line + line_off, y + px_y, rgb)
+                    .expect("greater than 64??");
             }
         }
 
-        remote.flush()?;
+        v
+    }).collect()
+}
+
+// run a worker with a programmed batch.
+fn worker(chunk: &[u8]) -> io::Result<()> {
+    let mut stream = BufWriter::new(TcpStream::connect(ADDR)?);
+
+    loop {
+        stream.write_all(chunk)?;
+        stream.flush()?;
     }
 }
 
 fn main() {
     let mut handles = Vec::new();
-    for i in 0..16 {
+    let chunks = chunkify_square(300, 300, 700, 0xFF0000, 16);
+    for (i, chunk) in chunks.into_iter().enumerate() {
         handles.push(thread::spawn(move || loop {
-            if let Err(e) = flooder(i * 100, (i * 100) % 1080) {
+            if let Err(e) = worker(&chunk[..]) {
                 println!("Restarting thread {}: {:?}", i, e);   
             }
         }));
