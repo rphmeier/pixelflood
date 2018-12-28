@@ -108,7 +108,11 @@ struct Work(Vec<u8>);
 
 // run a worker with a command receiver.
 fn worker(rx: &mpsc::Receiver<Work>) -> io::Result<()> {
-    let mut stream = BufWriter::new(TcpStream::connect(SMALL_SCREEN)?);
+    let mut stream = TcpStream::connect(SMALL_SCREEN)?;
+    stream.set_nonblocking(true)?;
+    stream.set_nodelay(true)?;
+
+    let mut stream = BufWriter::new(stream);
 
     let mut chunk = match rx.recv() {
         Ok(Work(chunk)) => chunk,
@@ -123,8 +127,19 @@ fn worker(rx: &mpsc::Receiver<Work>) -> io::Result<()> {
             Err(_) => panic!("main thread hung up."), 
         }
 
-        stream.write_all(&chunk[..])?;
-        stream.flush()?;
+        if let Err(e) = stream.write_all(&chunk[..]) {
+            match e.kind() {
+                io::ErrorKind::WouldBlock => {},
+                _ => return Err(e),
+            }
+        }
+
+        if let Err(e) = stream.flush() {
+            match e.kind() {
+                io::ErrorKind::WouldBlock => {}
+                _ => return Err(e),
+            }
+        }
     }
 }
 
