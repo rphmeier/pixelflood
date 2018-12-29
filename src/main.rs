@@ -179,12 +179,12 @@ fn with_workers(mut x: u32, mut y: u32, img_path: &str, workers: &[Worker]) {
     }
 }
 
-fn run_server() {
+fn run_server(magic: [u8; 16]) {
     // start distributed task.
     std::thread::spawn(|| {
         use futures::prelude::*;
 
-        distributed::listen(multiaddr![Ip4([0, 0, 0, 0]), Tcp(0u16)], *b"deadbeefcafebabe")
+        distributed::listen(multiaddr![Ip4([0, 0, 0, 0]), Tcp(0u16)], magic)
             .for_each(|sink| { std::mem::forget(sink); Ok(()) })
             .wait()
             .unwrap()
@@ -207,13 +207,18 @@ fn main() {
         workers.push(Worker { commands: tx, join_handle });
     }
 
+    let magic = {
+        let magic_v = std::env::var("MAGIC").ok().map(|s| s.into_bytes()).unwrap_or_else(Vec::new);
+        let len = std::cmp::min(magic_v.len(), 16);
+        let mut magic = [0; 16];
+        magic.copy_from_slice(&magic_v[..len]);
+
+        println!("magic = {:?}", magic);
+        magic
+    };
+
     match std::env::var("REMOTE").ok() {
         Some(addr) => {
-            let magic_v = std::env::var("MAGIC").ok().map(|s| s.into_bytes()).unwrap_or_else(Vec::new);
-            let len = std::cmp::min(magic_v.len(), 16);
-            let mut magic = [0; 16];
-            magic.copy_from_slice(&magic_v[..len]);
-
             distributed::client(addr.parse().expect("invalid multiaddr"), magic, THREADS)
                 .and_then(move |work_stream| {
                     work_stream.for_each(move |work| {
@@ -225,7 +230,7 @@ fn main() {
                 .unwrap();
         }
         None => {
-            run_server();
+            run_server(magic);
             let img_path = std::env::var("IMG_PATH").expect("Set IMG_PATH env var");
             with_workers(400, 400, img_path.as_str(), &workers[..]);
         }
