@@ -1,10 +1,17 @@
+#[macro_use] extern crate serde_derive;
+#[macro_use] extern crate libp2p;
+
 use std::path::Path;
 use std::net::TcpStream;
 use std::io::{self, Read, Write, BufReader, BufWriter};
 use std::thread;
 use std::sync::mpsc::{self, TryRecvError};
 
+use futures::prelude::*;
+
 use image::{GenericImage, GenericImageView};
+
+mod distributed;
 
 // Supported commands:
 // send pixel: 'PX {x} {y} {GG or RRGGBB or RRGGBBAA as HEX}\n'
@@ -45,6 +52,7 @@ fn chunks(width: u32, height: u32, n: u32) -> impl Iterator<Item=ChunkDescriptor
     })
 }
 
+#[allow(unused)]
 fn chunkify_square(x: u32, y: u32, size: u32, rgb: u32, n: u32) -> Vec<Vec<u8>> {
     let lines_per = size / n;
 
@@ -68,24 +76,16 @@ fn chunkify_square(x: u32, y: u32, size: u32, rgb: u32, n: u32) -> Vec<Vec<u8>> 
     }).collect()
 }
 
-fn chunkify_image(x: u32, y: u32, path: &str, n: u32) -> Vec<Vec<u8>> {
-    use std::fmt::Write as WriteFmt;
-    
-    let mut tiny = image::open(path).expect("provide valid image");
-    
-    tiny = tiny.resize(tiny.width() / 2, tiny.height() / 2, image::FilterType::Nearest);
-
-    let tiny = tiny.to_rgb();
-
-    let w = tiny.width();
-    let h = tiny.height();
+fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8>> {
+    let w = image.width();
+    let h = image.height();
 
     chunks(w, h, n).map(|descriptor| {
         let mut v = Vec::new();
 
         for line in 0..descriptor.width {
             for px_y in 0..descriptor.height {
-                let pixel = tiny.get_pixel(line, px_y);
+                let pixel = image.get_pixel(line, px_y);
 
                 write!(
                     &mut v, 
@@ -108,7 +108,7 @@ struct Work(Vec<u8>);
 
 // run a worker with a command receiver.
 fn worker(rx: &mpsc::Receiver<Work>) -> io::Result<()> {
-    let mut stream = TcpStream::connect(SMALL_SCREEN)?;
+    let mut stream = TcpStream::connect(BIG_SCREEN)?;
     stream.set_nonblocking(true)?;
     stream.set_nodelay(true)?;
 
@@ -155,8 +155,10 @@ fn with_workers(mut x: u32, mut y: u32, img_path: &str, workers: &[Worker]) {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
 
+    let image = image::open(img_path).expect("provide valid image").to_rgb();
+
     loop {
-        let chunks = chunkify_image(x, y, img_path, THREADS);
+        let chunks = chunkify_image(&image, x, y, THREADS);
         for (i, chunk) in chunks.into_iter().enumerate().take(THREADS as _) {
             let _ = workers[i].commands.send(Work(chunk));
         }
@@ -177,9 +179,22 @@ fn with_workers(mut x: u32, mut y: u32, img_path: &str, workers: &[Worker]) {
     }
 }
 
+fn run_server() {
+    // start distributed task.
+    std::thread::spawn(|| {
+        use futures::prelude::*;
+
+        distributed::listen(multiaddr![Ip4([0, 0, 0, 0]), Tcp(0u16)], *b"deadbeefcafebabe")
+            .for_each(|sink| { std::mem::forget(sink); Ok(()) })
+            .wait()
+            .unwrap()
+    });
+}
+
 fn main() {
+    // local workers.
     let mut workers = Vec::new();
-    
+
     for i in 0..THREADS {
         let (tx, rx) = mpsc::channel();
 
@@ -192,9 +207,30 @@ fn main() {
         workers.push(Worker { commands: tx, join_handle });
     }
 
-    let img_path = std::env::var("IMG_PATH").expect("Set IMG_PATH env var");
-    with_workers(400, 400, img_path.as_str(), &workers[..]);
-    
+    match std::env::var("REMOTE").ok() {
+        Some(addr) => {
+            let magic_v = std::env::var("MAGIC").ok().map(|s| s.into_bytes()).unwrap_or_else(Vec::new);
+            let len = std::cmp::min(magic_v.len(), 16);
+            let mut magic = [0; 16];
+            magic.copy_from_slice(&magic_v[..len]);
+
+            distributed::client(addr.parse().expect("invalid multiaddr"), magic, THREADS)
+                .and_then(move |work_stream| {
+                    work_stream.for_each(move |work| {
+                        drop(work);
+                        Ok(())
+                    })
+                })
+                .wait()
+                .unwrap();
+        }
+        None => {
+            run_server();
+            let img_path = std::env::var("IMG_PATH").expect("Set IMG_PATH env var");
+            with_workers(400, 400, img_path.as_str(), &workers[..]);
+        }
+    }
+
     for handle in workers {
         handle.join_handle.join().unwrap();
     }
