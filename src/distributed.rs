@@ -140,22 +140,32 @@ pub fn listen(addr: Multiaddr, magic: [u8; 16]) -> impl Stream<Item=BufSink<impl
             let read = BufReader::new(read);
 
             io::write_all(write, magic)
-                .and_then(move |(w, _)| io::read_exact(read, [0u8; 20])
+                .and_then(|(w, _)| io::flush(w))
+                .and_then(move |w| io::read_exact(read, [0u8; 20])
                     .map(move |(a, b)| (a, b, w))
                 )
                 .map_err(Into::into)
-                .and_then(move |(_read, handshake, write)| {
+                .map(move |(_read, handshake, write)| {
                     let received_magic = &handshake[0..16];
                     let n_workers = LittleEndian::read_u32(&handshake[16..]);
 
                     if received_magic != &magic[..] {
-                        Err(Error::BadMagic)
+                        println!("Rejecting client: bad magic number");
+                        None
                     } else {
                         println!("Handshook connection with {} workers", n_workers);
-                        Ok(BufSink { n_workers, state: BufSinkState::Ready(write) })
+                        Some(BufSink { n_workers, state: BufSinkState::Ready(write) })
+                    }
+                })
+                .then(|res: Result<_, Error>| match res {
+                    Ok(x) => Ok(x),
+                    Err(e) => {
+                        println!("Failed connection: {:?}", e);
+                        Ok(None)
                     }
                 })
         })
+        .filter_map(|x| x)
 }
 
 /// Connect to server as client. Provide given magic number to compare against the server.
@@ -169,6 +179,7 @@ pub fn client(addr: Multiaddr, magic: [u8; 16], n_workers: u32) -> impl Future<I
         .map_err(Into::into)
         .and_then(move |(read, received_magic, write)| {
             if received_magic != magic {
+                println!("Mismatch: server had different magic number");
                 Err(Error::BadMagic)
             } else {
                 let mut handshake = [0u8; 20];
@@ -178,7 +189,9 @@ pub fn client(addr: Multiaddr, magic: [u8; 16], n_workers: u32) -> impl Future<I
             }
         })
         .and_then(|write_all| write_all.map_err(Into::into))
-        .map(|(read, _write)| {
+        .and_then(|(read, write)| io::flush(write).map(move |_| read).map_err(Into::into))
+        .map(|read| {
+            println!("wrote all");
             stream::unfold(read, |read| {
                 let read_next = io::read_exact(read, [0; 4])
                     .and_then(|(read, len)| {

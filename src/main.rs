@@ -28,7 +28,7 @@ const SMALL_SCREEN: &str = "151.217.177.136:1234";
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 
-const THREADS: u32 = 20;
+const THREADS: u32 = 10;
 
 struct ChunkDescriptor {
     x: u32,
@@ -181,7 +181,7 @@ fn with_workers(mut x: u32, mut y: u32, img_path: &str, workers: &[Worker]) {
 
 fn run_server(magic: [u8; 16]) {
     // start distributed task.
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
         use futures::prelude::*;
 
         distributed::listen(multiaddr![Ip4([0, 0, 0, 0]), Tcp(0u16)], magic)
@@ -211,7 +211,8 @@ fn main() {
         let magic_v = std::env::var("MAGIC").ok().map(|s| s.into_bytes()).unwrap_or_else(Vec::new);
         let len = std::cmp::min(magic_v.len(), 16);
         let mut magic = [0; 16];
-        magic.copy_from_slice(&magic_v[..len]);
+
+        magic[..len].copy_from_slice(&magic_v[0..len]);
 
         println!("magic = {:?}", magic);
         magic
