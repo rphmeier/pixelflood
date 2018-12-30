@@ -1,15 +1,18 @@
-#[macro_use] extern crate serde_derive;
+//#[macro_use] extern crate serde_derive;
 #[macro_use] extern crate libp2p;
 
-use std::path::Path;
 use std::net::TcpStream;
-use std::io::{self, Read, Write, BufReader, BufWriter};
+use std::io::{self, Read, Write, BufWriter};
 use std::thread;
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc::{self as std_mpsc, TryRecvError};
+use std::sync::Arc;
 
 use futures::prelude::*;
+use futures::{future, stream};
+use futures::sync::mpsc;
 
-use image::{GenericImage, GenericImageView};
+use image::GenericImageView;
+use parking_lot::Mutex;
 
 mod distributed;
 
@@ -90,8 +93,8 @@ fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8
                 write!(
                     &mut v, 
                     "PX {} {} {:02X}{:02X}{:02X}\n", 
-                    descriptor.x + line, 
-                    descriptor.y + px_y, 
+                    x + descriptor.x + line, 
+                    y + descriptor.y + px_y, 
                     pixel.data[0], 
                     pixel.data[1], 
                     pixel.data[2],
@@ -107,8 +110,8 @@ fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8
 struct Work(Vec<u8>);
 
 // run a worker with a command receiver.
-fn worker(rx: &mpsc::Receiver<Work>) -> io::Result<()> {
-    let mut stream = TcpStream::connect(BIG_SCREEN)?;
+fn worker(rx: &std_mpsc::Receiver<Work>) -> io::Result<()> {
+    let stream = TcpStream::connect(BIG_SCREEN)?;
     stream.set_nonblocking(true)?;
     stream.set_nodelay(true)?;
 
@@ -144,21 +147,26 @@ fn worker(rx: &mpsc::Receiver<Work>) -> io::Result<()> {
 }
 
 struct Worker {
-    commands: mpsc::Sender<Work>,
+    commands: std_mpsc::Sender<Work>,
     join_handle: thread::JoinHandle<()>,
 }
 
-fn with_workers(mut x: u32, mut y: u32, img_path: &str, workers: &[Worker]) {
+fn with_workers(
+    mut x: u32, 
+    mut y: u32, 
+    image: &image::RgbImage, 
+    workers: &[Worker], 
+    send_commands: mpsc::UnboundedSender<DrawCommand>
+) {
     const D_X: u32 = 25;
     const D_Y: u32 = 50;
 
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
 
-    let image = image::open(img_path).expect("provide valid image").to_rgb();
-
     loop {
         let chunks = chunkify_image(&image, x, y, THREADS);
+        let _ = send_commands.unbounded_send(DrawCommand { x, y });
         for (i, chunk) in chunks.into_iter().enumerate().take(THREADS as _) {
             let _ = workers[i].commands.send(Work(chunk));
         }
@@ -179,16 +187,80 @@ fn with_workers(mut x: u32, mut y: u32, img_path: &str, workers: &[Worker]) {
     }
 }
 
-fn run_server(magic: [u8; 16]) {
-    // start distributed task.
-    std::thread::spawn(move || {
-        use futures::prelude::*;
+struct DrawCommand {
+    x: u32,
+    y: u32,
+}
 
-        distributed::listen(multiaddr![Ip4([0, 0, 0, 0]), Tcp(0u16)], magic)
-            .for_each(|sink| { std::mem::forget(sink); Ok(()) })
-            .wait()
-            .unwrap()
+fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::UnboundedReceiver<DrawCommand>) -> impl Future<Item=(),Error=()> {
+    type BoxEmptyFut = Box<dyn Future<Item=(),Error=()>>;
+
+    enum Event<S> {
+        NewSink(S),
+        Draw(DrawCommand),
+    }
+    
+    let (sink_tx, sink_rx) = mpsc::unbounded();
+
+    let send_sinks = distributed::listen(multiaddr![Ip4([0, 0, 0, 0]), Tcp(0u16)], magic)
+        .for_each(move |sink| {
+            sink_tx.clone().send(Event::NewSink(sink)).then(|_| Ok(()))
+        })
+        .map_err(|_| ());
+
+    let sinks = Arc::new(Mutex::new(Vec::new()));
+    let mut last_command: Option<DrawCommand> = None;
+
+    let send_work = sink_rx.select(new_commands.map(Event::Draw)).for_each(move |event| match event {
+        Event::NewSink(sink) => {
+            if let Some(ref cmd) = last_command {
+                let chunks = chunkify_image(&image, cmd.x, cmd.y, sink.n_workers());
+                let sinks = sinks.clone();
+                println!("Sending work to new connection");
+                Box::new(
+                    sink.send(distributed::WorkPackage { data: chunks })
+                        .then(move |res| { if let Ok(sink) = res { 
+                                sinks.lock().push(sink);
+                            }
+                            Ok(())
+                        })
+                ) as BoxEmptyFut
+            } else {
+                println!("Got new connection with no work available");
+                sinks.lock().push(sink);
+                Box::new(future::ok(())) as BoxEmptyFut
+            }
+        }
+        Event::Draw(command) => {
+            println!("Sending work to all connections");
+
+            last_command = Some(command);
+            let cmd = last_command.as_ref().expect("just set; qed");
+
+            // send to all sinks.
+            // if it succeeds we add again to the buffer.
+            let last_sinks = {
+                let mut sinks = sinks.lock();
+                std::mem::replace(&mut *sinks, Vec::new())
+            };
+
+            let work: Vec<_> = last_sinks.into_iter().map(|sink| {
+                let chunks = chunkify_image(&image, cmd.x, cmd.y, sink.n_workers());
+                sink.send(distributed::WorkPackage { data: chunks })
+            }).collect();
+
+            let sinks = sinks.clone();
+            Box::new(stream::futures_unordered(work)
+                .then(move |res| match res {
+                    Ok(sink) => { sinks.lock().push(sink); Ok(()) }
+                    Err(e) => { println!("Connection closed: {:?}", e); Ok(()) }
+                })
+                .for_each(|()| Ok(()))
+            ) as BoxEmptyFut
+        }
     });
+
+    send_sinks.join(send_work).then(|_| Ok(()))
 }
 
 fn main() {
@@ -196,7 +268,7 @@ fn main() {
     let mut workers = Vec::new();
 
     for i in 0..THREADS {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = std_mpsc::channel();
 
         let join_handle = thread::spawn(move || loop {
             if let Err(e) = worker(&rx) {
@@ -223,7 +295,10 @@ fn main() {
             distributed::client(addr.parse().expect("invalid multiaddr"), magic, THREADS)
                 .and_then(move |work_stream| {
                     work_stream.for_each(move |work| {
-                        drop(work);
+                        println!("Got work with {} parts from server.", work.data.len());
+                        for (i, chunk) in work.data.into_iter().enumerate().take(workers.len()) {
+                            let _ = workers[i].commands.send(Work(chunk));
+                        }
                         Ok(())
                     })
                 })
@@ -231,13 +306,16 @@ fn main() {
                 .unwrap();
         }
         None => {
-            run_server(magic);
             let img_path = std::env::var("IMG_PATH").expect("Set IMG_PATH env var");
-            with_workers(400, 400, img_path.as_str(), &workers[..]);
-        }
-    }
+            let image = image::open(img_path.as_str()).expect("provide valid image").to_rgb();
+            let (cmd_tx, cmd_rx) = mpsc::unbounded();
 
-    for handle in workers {
-        handle.join_handle.join().unwrap();
+            let workers_img = image.clone();
+            std::thread::spawn(move || 
+                with_workers(400, 400, &workers_img, &workers[..], cmd_tx)
+            );
+
+            run_server(magic, image, cmd_rx).wait().unwrap();
+        }
     }
 }

@@ -45,7 +45,8 @@ fn listen_secure(addr: Multiaddr) -> impl Stream<Item = impl AsyncRead + AsyncWr
 
 /// Vector of draw commands.
 pub struct WorkPackage {
-    data: Vec<Vec<u8>>,
+    /// The draw commands.
+    pub data: Vec<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -62,23 +63,23 @@ impl From<IoError> for Error {
 }
 
 /// A sink for a buffer over a remote connection.
-pub struct BufSink<T> {
+pub struct BufSink<T: 'static> {
     n_workers: u32,
     state: BufSinkState<T>,
 }
 
-enum BufSinkState<T> {
+enum BufSinkState<T: 'static> {
     Ready(T),
-    Writing(io::WriteAll<T, Vec<u8>>),
+    Writing(Box<Future<Item=T,Error=IoError>>),
     Empty,
 }
 
-impl<T> BufSink<T> {
+impl<T: 'static> BufSink<T> {
     /// The number of workers.
     pub fn n_workers(&self) -> u32 { self.n_workers }
 }
 
-impl<T> Sink for BufSink<T> 
+impl<T: 'static> Sink for BufSink<T> 
     where T: AsyncWrite,
 {
     type SinkItem = WorkPackage;
@@ -93,7 +94,8 @@ impl<T> Sink for BufSink<T>
                 LittleEndian::write_u32(&mut buf[..4], size as u32);
                 bincode::serialize_into(&mut buf[4..], &item.data).expect("can serialize bytes");
 
-                self.state = BufSinkState::Writing(io::write_all(s, buf));
+                let write_and_flush = Box::new(io::write_all(s, buf).and_then(|(s, _)| io::flush(s)));
+                self.state = BufSinkState::Writing(write_and_flush);
                 Ok(AsyncSink::Ready)
             }
             other => {
@@ -114,7 +116,7 @@ impl<T> Sink for BufSink<T>
                     self.state = BufSinkState::Writing(work);
                     Ok(Async::NotReady)
                 }
-                Async::Ready((w, _)) => {
+                Async::Ready(w) => {
                     self.state = BufSinkState::Ready(w);
                     Ok(Async::Ready(()))
                 }
@@ -196,7 +198,7 @@ pub fn client(addr: Multiaddr, magic: [u8; 16], n_workers: u32) -> impl Future<I
                 let read_next = io::read_exact(read, [0; 4])
                     .and_then(|(read, len)| {
                         let len = LittleEndian::read_u32(&len[..]);
-                        let mut buf = vec![0; len as usize];
+                        let buf = vec![0; len as usize];
                         io::read_exact(read, buf)
                     })
                     .map_err(Into::into)
