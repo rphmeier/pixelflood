@@ -1,9 +1,9 @@
 use std::mem;
 use std::io::{Error as IoError, BufReader};
 
-use futures::{future, stream, Future};
+use futures::{stream, Future};
 use libp2p::secio::{SecioConfig, SecioKeyPair, SecioOutput};
-use libp2p::core::{Multiaddr, upgrade::apply_inbound};
+use libp2p::core::Multiaddr;
 use libp2p::core::transport::Transport;
 use libp2p::tcp::TcpConfig;
 use libp2p::tokio_io::{io, AsyncRead, AsyncWrite};

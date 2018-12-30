@@ -11,7 +11,6 @@ use futures::prelude::*;
 use futures::{future, stream};
 use futures::sync::mpsc;
 
-use image::GenericImageView;
 use parking_lot::Mutex;
 
 mod distributed;
@@ -26,10 +25,6 @@ mod distributed;
 
 // production addr.
 const BIG_SCREEN: &str = "151.217.40.82:1234";
-const SMALL_SCREEN: &str = "151.217.177.136:1234";
-
-const WIDTH: u32 = 1920;
-const HEIGHT: u32 = 1080;
 
 const THREADS: u32 = 10;
 
@@ -91,15 +86,23 @@ fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8
                 let pixel = image.get_pixel(line, px_y);
 
                 write!(
+                    &mut v,
+                    "OFFSET {} {}\n",
+                    x,
+                    y
+                )
+                    .expect("can always write to vec");
+
+                write!(
                     &mut v, 
                     "PX {} {} {:02X}{:02X}{:02X}\n", 
-                    x + descriptor.x + line, 
-                    y + descriptor.y + px_y, 
+                    descriptor.x + line, 
+                    descriptor.y + px_y, 
                     pixel.data[0], 
                     pixel.data[1], 
                     pixel.data[2],
                 )
-                    .expect("greater than 64??");
+                    .expect("can always write to vec");
             }
         }
 
@@ -146,9 +149,9 @@ fn worker(rx: &std_mpsc::Receiver<Work>) -> io::Result<()> {
     }
 }
 
+#[derive(Clone)]
 struct Worker {
     commands: std_mpsc::Sender<Work>,
-    join_handle: thread::JoinHandle<()>,
 }
 
 fn with_workers(
@@ -270,13 +273,13 @@ fn main() {
     for i in 0..THREADS {
         let (tx, rx) = std_mpsc::channel();
 
-        let join_handle = thread::spawn(move || loop {
+        thread::spawn(move || loop {
             if let Err(e) = worker(&rx) {
                 println!("Restarting thread {}: {:?}", i, e);   
             }
         });
 
-        workers.push(Worker { commands: tx, join_handle });
+        workers.push(Worker { commands: tx });
     }
 
     let magic = {
