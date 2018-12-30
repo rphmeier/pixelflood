@@ -57,6 +57,14 @@ fn chunkify_square(x: u32, y: u32, size: u32, rgb: u32, n: u32) -> Vec<Vec<u8>> 
     chunks(size, size, n).map(|descriptor| {
         let mut v = Vec::new();
 
+        write!(
+            &mut v,
+            "OFFSET {} {}\n",
+            x,
+            y
+        )
+            .expect("can always write to vec");
+
         for line in 0..descriptor.width {
             for px_y in 0..descriptor.height {
                 write!(
@@ -66,7 +74,7 @@ fn chunkify_square(x: u32, y: u32, size: u32, rgb: u32, n: u32) -> Vec<Vec<u8>> 
                     descriptor.y + px_y, 
                     rgb,
                 )
-                    .expect("greater than 64??");
+                    .expect("can always write to vec");
             }
         }
 
@@ -81,17 +89,17 @@ fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8
     chunks(w, h, n).map(|descriptor| {
         let mut v = Vec::new();
 
+        write!(
+            &mut v,
+            "OFFSET {} {}\n",
+            x,
+            y
+        )
+            .expect("can always write to vec");
+
         for line in 0..descriptor.width {
             for px_y in 0..descriptor.height {
                 let pixel = image.get_pixel(line, px_y);
-
-                write!(
-                    &mut v,
-                    "OFFSET {} {}\n",
-                    x,
-                    y
-                )
-                    .expect("can always write to vec");
 
                 write!(
                     &mut v, 
@@ -222,8 +230,13 @@ fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::Unbou
                 println!("Sending work to new connection");
                 Box::new(
                     sink.send(distributed::WorkPackage { data: chunks })
-                        .then(move |res| { if let Ok(sink) = res { 
-                                sinks.lock().push(sink);
+                        .then(move |res| { match res { 
+                                Ok(sink) => {
+                                    sinks.lock().push(sink);
+                                }
+                                Err(e) => {
+                                    println!("failed to send work: {:?}", e);
+                                }
                             }
                             Ok(())
                         })

@@ -1,7 +1,7 @@
 use std::mem;
 use std::io::{Error as IoError, BufReader};
 
-use futures::{stream, Future};
+use futures::{future, stream, Future};
 use libp2p::secio::{SecioConfig, SecioKeyPair, SecioOutput};
 use libp2p::core::Multiaddr;
 use libp2p::core::transport::Transport;
@@ -88,14 +88,28 @@ impl<T: 'static> Sink for BufSink<T>
     fn start_send(&mut self, item: WorkPackage) -> StartSend<WorkPackage, IoError> {
         match mem::replace(&mut self.state, BufSinkState::Empty) {
             BufSinkState::Ready(s) => {
+                const MAX_BUFFER: usize = 6 * 1024 * 1024;
+
                 let size = bincode::serialized_size(&item.data).expect("can serialize bytes");
 
                 let mut buf = vec![0; 4 + size as usize];
                 LittleEndian::write_u32(&mut buf[..4], size as u32);
                 bincode::serialize_into(&mut buf[4..], &item.data).expect("can serialize bytes");
 
-                let write_and_flush = Box::new(io::write_all(s, buf).and_then(|(s, _)| io::flush(s)));
-                self.state = BufSinkState::Writing(write_and_flush);
+                // write while flushing periodically to avoid running into buffer issues.
+                let write_chunked = future::loop_fn((s, buf), |(s, mut buf)| {
+                    if buf.len() <= MAX_BUFFER {
+                        let a = io::write_all(s, buf).and_then(|(s, _)| io::flush(s).map(future::Loop::Break));
+                        future::Either::A(a)
+                    } else {
+                        let pre_buf: Vec<_> = buf.drain(..MAX_BUFFER).collect();
+                        let b = io::write_all(s, pre_buf).and_then(|(s, _)| io::flush(s))
+                            .map(move |s| future::Loop::Continue((s, buf)));
+                        future::Either::B(b)
+                    }
+                });
+
+                self.state = BufSinkState::Writing(Box::new(write_chunked));
                 Ok(AsyncSink::Ready)
             }
             other => {
@@ -193,7 +207,6 @@ pub fn client(addr: Multiaddr, magic: [u8; 16], n_workers: u32) -> impl Future<I
         .and_then(|write_all| write_all.map_err(Into::into))
         .and_then(|(read, write)| io::flush(write).map(move |_| read).map_err(Into::into))
         .map(|read| {
-            println!("wrote all");
             stream::unfold(read, |read| {
                 let read_next = io::read_exact(read, [0; 4])
                     .and_then(|(read, len)| {
