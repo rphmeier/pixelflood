@@ -1,7 +1,7 @@
 //#[macro_use] extern crate serde_derive;
 #[macro_use] extern crate libp2p;
 
-use std::net::TcpStream;
+use std::net::{TcpStream, SocketAddr};
 use std::io::{self, Read, Write, BufWriter};
 use std::thread;
 use std::sync::mpsc::{self as std_mpsc, TryRecvError};
@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 
 mod distributed;
 
-// Supported commands:
+// Supported commands on server side:
 // send pixel: 'PX {x} {y} {GG or RRGGBB or RRGGBBAA as HEX}\n'
 // set offset for future pixels: 'OFFSET {x} {y}\n'
 // request pixel color: 'PX {x} {y}\n'
@@ -121,8 +121,8 @@ fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8
 struct Work(Vec<u8>);
 
 // run a worker with a command receiver.
-fn worker(rx: &std_mpsc::Receiver<Work>) -> io::Result<()> {
-    let stream = TcpStream::connect(BIG_SCREEN)?;
+fn worker(screen: SocketAddr, rx: &std_mpsc::Receiver<Work>) -> io::Result<()> {
+    let stream = TcpStream::connect(screen)?;
     stream.set_nonblocking(true)?;
     stream.set_nodelay(true)?;
 
@@ -203,7 +203,7 @@ struct DrawCommand {
     y: u32,
 }
 
-fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::UnboundedReceiver<DrawCommand>) -> impl Future<Item=(),Error=()> {
+fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::UnboundedReceiver<DrawCommand>, port: u16) -> impl Future<Item=(),Error=()> {
     type BoxEmptyFut = Box<dyn Future<Item=(),Error=()>>;
 
     enum Event<S> {
@@ -213,7 +213,7 @@ fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::Unbou
     
     let (sink_tx, sink_rx) = mpsc::unbounded();
 
-    let send_sinks = distributed::listen(multiaddr![Ip4([0, 0, 0, 0]), Tcp(0u16)], magic)
+    let send_sinks = distributed::listen(multiaddr![Ip4([0, 0, 0, 0]), Tcp(port)], magic)
         .for_each(move |sink| {
             sink_tx.clone().send(Event::NewSink(sink)).then(|_| Ok(()))
         })
@@ -283,11 +283,16 @@ fn main() {
     // local workers.
     let mut workers = Vec::new();
 
+    let screen: SocketAddr = std::env::var("SCREEN").ok()
+        .unwrap_or_else(|| BIG_SCREEN.to_string())
+        .parse()
+        .unwrap();
+
     for i in 0..THREADS {
         let (tx, rx) = std_mpsc::channel();
 
         thread::spawn(move || loop {
-            if let Err(e) = worker(&rx) {
+            if let Err(e) = worker(screen, &rx) {
                 println!("Restarting thread {}: {:?}", i, e);   
             }
         });
@@ -322,6 +327,8 @@ fn main() {
                 .unwrap();
         }
         None => {
+            let port: u16 = std::env::var("PORT").ok().map(|s| s.parse().unwrap()).unwrap_or(0);
+
             let img_path = std::env::var("IMG_PATH").expect("Set IMG_PATH env var");
             let image = image::open(img_path.as_str()).expect("provide valid image").to_rgb();
             let (cmd_tx, cmd_rx) = mpsc::unbounded();
@@ -331,7 +338,7 @@ fn main() {
                 with_workers(400, 400, &workers_img, &workers[..], cmd_tx)
             );
 
-            run_server(magic, image, cmd_rx).wait().unwrap();
+            run_server(magic, image, cmd_rx, port).wait().unwrap();
         }
     }
 }
