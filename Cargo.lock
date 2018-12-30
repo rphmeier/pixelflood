@@ -1301,6 +1301,7 @@ dependencies = [
  "parking_lot 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde 1.0.83 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_derive 1.0.83 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio-tcp 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]

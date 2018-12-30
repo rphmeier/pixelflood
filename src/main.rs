@@ -1,7 +1,7 @@
 //#[macro_use] extern crate serde_derive;
 #[macro_use] extern crate libp2p;
 
-use std::net::{TcpStream, SocketAddr};
+use std::net::SocketAddr;
 use std::io::{self, Read, Write, BufWriter};
 use std::thread;
 use std::sync::mpsc::{self as std_mpsc, TryRecvError};
@@ -12,6 +12,7 @@ use futures::{future, stream};
 use futures::sync::mpsc;
 
 use parking_lot::Mutex;
+use libp2p::tokio_io::io as async_io;
 
 mod distributed;
 
@@ -124,29 +125,36 @@ fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8
 struct Work(Vec<u8>);
 
 // run a worker with a command receiver.
-fn worker(screen: SocketAddr, rx: &std_mpsc::Receiver<Work>) -> io::Result<()> {
-    let stream = TcpStream::connect(screen)?;
-    println!("connected to remote");
-    stream.set_nodelay(true)?;
+fn worker<'a>(screen: SocketAddr, rx: &'a std_mpsc::Receiver<Work>) -> impl Future<Item=(),Error=io::Error> + 'a {
+    tokio_tcp::TcpStream::connect(&screen)
+        .and_then(move |stream| {
+            println!("connected to remote");
+            if let Err(e) = stream.set_nodelay(true) {
+                return future::Either::A(future::err(e));
+            }
 
-    let mut stream = BufWriter::new(stream);
+            // TODO: don't block here...
+            let chunk = match rx.recv() {
+                Ok(Work(chunk)) => chunk,
+                Err(e) => panic!("main thread never sent work: {:?}", e),
+            };
 
-    let mut chunk = match rx.recv() {
-        Ok(Work(chunk)) => chunk,
-        Err(e) => panic!("main thread never sent work: {:?}", e),
-    };
+            let stream = BufWriter::new(stream);
+            let loop_forever = future::loop_fn((stream, chunk), move |(stream, mut chunk)| {
+                // check for new work.
+                match rx.try_recv() {
+                    Ok(Work(new_chunk)) => { chunk = new_chunk },
+                    Err(TryRecvError::Empty) => {},
+                    Err(_) => panic!("main thread hung up."), 
+                }
 
-    loop {
-        // check for new work.
-        match rx.try_recv() {
-            Ok(Work(new_chunk)) => { chunk = new_chunk },
-            Err(TryRecvError::Empty) => {},
-            Err(_) => panic!("main thread hung up."), 
-        }
+                async_io::write_all(stream, chunk)
+                    .and_then(|(s, chunk)| async_io::flush(s).map(move |s| (s, chunk)))
+                    .map(future::Loop::Continue)
+            });
 
-        stream.write_all(&chunk[..])?;
-        stream.flush()?;
-    }
+            future::Either::B(loop_forever)
+        })
 }
 
 #[derive(Clone)]
@@ -284,7 +292,7 @@ fn main() {
         let (tx, rx) = std_mpsc::channel();
 
         thread::spawn(move || loop {
-            if let Err(e) = worker(screen, &rx) {
+            if let Err(e) = worker(screen, &rx).wait() {
                 println!("Restarting thread {}: {:?}", i, e);   
             }
         });
