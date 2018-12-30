@@ -1,10 +1,9 @@
-//#[macro_use] extern crate serde_derive;
+#[macro_use] extern crate serde_derive;
 #[macro_use] extern crate libp2p;
 
 use std::net::SocketAddr;
 use std::io::{self, Read, Write, BufWriter};
 use std::thread;
-use std::sync::mpsc::{self as std_mpsc, TryRecvError};
 use std::sync::Arc;
 
 use futures::prelude::*;
@@ -12,7 +11,7 @@ use futures::{future, stream};
 use futures::sync::mpsc;
 
 use parking_lot::Mutex;
-use libp2p::tokio_io::io as async_io;
+use libp2p::tokio_io::{self, io as async_io};
 
 mod distributed;
 
@@ -37,137 +36,195 @@ struct ChunkDescriptor {
     height: u32,
 }
 
-fn chunks(width: u32, height: u32, n: u32) -> impl Iterator<Item=ChunkDescriptor> {
-    let lines_per = width / n;
+fn chunks(width: u32, height: u32) -> impl Iterator<Item=ChunkDescriptor> {
+    const CHUNK_DIM: u32 = 99; // 100 is 3 bytes, so we limit to 2.
+    
+    let col_per = width / CHUNK_DIM;
+    let h_split = col_per + if width % CHUNK_DIM == 0 { 0 } else { 1 };
 
-    (0..n).map(move |i| {
-        let line_off = i*lines_per;
+    let row_per = height / CHUNK_DIM;
+    let v_split = row_per + if height % CHUNK_DIM == 0 { 0 } else { 1 };
 
-        ChunkDescriptor {
-            x: line_off,
-            y: 0,
-            width: lines_per,
-            height,
+    (0..h_split).flat_map(move |i| {
+        let col_off = i*CHUNK_DIM;
+
+        (0..v_split).map(move |j| {
+            let row_off = j*CHUNK_DIM;
+            let local_width = std::cmp::min(width - col_off, CHUNK_DIM);
+            let local_height = std::cmp::min(height - row_off, CHUNK_DIM);
+
+            ChunkDescriptor {
+                x: col_off,
+                y: row_off,
+                width: local_width,
+                height: local_height,
+            }
+        })
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+struct Chunked {
+    raw: Vec<u8>,
+    valid_offsets: Vec<u32>,
+}
+
+/// Chunkify some rectangular thing. Provide a function for color lookup (none for alpha)
+/// for any pixel within the provided width and height.
+fn chunkify<F>(x: u32, y: u32, w: u32, h: u32, rgb: F) -> Chunked
+    where F: Fn(u32, u32) -> Option<[u8; 3]>
+{
+    let mut data = Vec::new();
+    let mut offsets = Vec::new();
+    for descriptor in chunks(w, h) {
+        let pre_len = data.len();
+        write!(
+            &mut data,
+            "OFFSET {} {}\n",
+            x + descriptor.x,
+            y + descriptor.y,
+        )
+            .expect("can always write to vec");
+
+        let offset_len = data.len();
+
+        let coords = (0..descriptor.width)
+            .flat_map(|x| (0..descriptor.height).map(move |y| (x, y)));
+
+        for (px_x, px_y) in coords {
+            let pixel = match rgb(descriptor.x + px_x, descriptor.y + px_y) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            write!(
+                &mut data, 
+                "PX {} {} {:02X}{:02X}{:02X}\n", 
+                px_x, 
+                px_y, 
+                pixel[0], 
+                pixel[1], 
+                pixel[2],
+            )
+                .expect("can always write to vec");
+        }
+
+        if data.len() == offset_len {
+            // empty chunk.
+            data.truncate(pre_len);
+        } else {
+            // note valid offset.
+            offsets.push(pre_len as u32);
+        }
+    }
+
+    Chunked {
+        raw: data,
+        valid_offsets: offsets,
+    }
+}
+
+/// Chunkify an RGBA image.
+fn chunkify_image(x: u32, y: u32, image: &image::RgbaImage) -> Chunked {
+    chunkify(x, y, image.width(), image.height(), |px_x, px_y| {
+        let mut rgb = [0u8; 3];
+        let pixel = image.get_pixel(px_x, px_y);
+
+        if pixel.data[3] == 0 {
+            None
+        } else {
+            rgb.copy_from_slice(&pixel.data[..3]);
+            Some(rgb)
         }
     })
 }
 
-#[allow(unused)]
-fn chunkify_square(x: u32, y: u32, size: u32, rgb: u32, n: u32) -> Vec<Vec<u8>> {
-    let lines_per = size / n;
+/// A draw command, to be sent either to a local worker or a remote connection.
+#[derive(Clone)]
+pub(crate) struct DrawCommand {
+    data: Arc<Chunked>,
+}
 
-    chunks(size, size, n).map(|descriptor| {
-        let mut v = Vec::new();
+impl DrawCommand {
+    fn chunked_data(&self) -> &Chunked { &*self.data }
+    fn from_chunked(chunked: Chunked) -> Self {
+        DrawCommand { data: Arc::new(chunked) }
+    }
 
-        // write!(
-        //     &mut v,
-        //     "OFFSET {} {}\n",
-        //     x,
-        //     y
-        // )
-        //     .expect("can always write to vec");
+    // writes to the writer starting from a random valid point in the
+    // chunked data and then looping around again.
+    fn write_random<W: tokio_io::AsyncWrite>(self, write: W) -> impl Future<Item=(W, Self),Error=io::Error> {
+        use rand::{self, Rng};
 
-        for line in 0..descriptor.width {
-            for px_y in 0..descriptor.height {
-                write!(
-                    &mut v, 
-                    "PX {} {} {:06X}\n", 
-                    x + descriptor.x + line,
-                    y + descriptor.y + px_y, 
-                    rgb,
-                )
-                    .expect("can always write to vec");
+        struct RandomChoice {
+            data: Arc<Chunked>,
+            start: usize,
+            end: usize,
+        }
+
+        impl AsRef<[u8]> for RandomChoice {
+            fn as_ref(&self) -> &[u8] {
+                &self.data.raw[self.start..self.end]
             }
         }
 
-        v
-    }).collect()
+        let offset_i = rand::thread_rng().gen_range(0, self.data.valid_offsets.len());
+        let offset = self.data.valid_offsets[offset_i];
+        let len = self.data.raw.len();
+
+        async_io::write_all(write, RandomChoice { // write offset..
+            data: self.data, 
+            start: offset as _, 
+            end: len 
+        })
+            .and_then(|(write, choice)| async_io::write_all(write, RandomChoice {
+                data: choice.data, // write ..offset
+                start: 0,
+                end: choice.start,
+            }))
+            .and_then(|(write, choice)| {
+                let s = DrawCommand { data: choice.data }; // and flush.
+                async_io::flush(write).map(move |w| (w, s))
+            })
+    }
 }
-
-fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8>> {
-    let w = image.width();
-    let h = image.height();
-
-    chunks(w, h, n).map(|descriptor| {
-        let mut v = Vec::new();
-
-        println!("writing pixels for chunk {:?}", descriptor);
-
-        write!(
-            &mut v,
-            "OFFSET {} {}\n",
-            x,
-            y,
-        )
-            .expect("can always write to vec");
-
-        for line in 0..descriptor.width {
-            for px_y in 0..descriptor.height {
-                let pixel = image.get_pixel(descriptor.x + line, descriptor.y + px_y);
-
-                write!(
-                    &mut v, 
-                    "PX {} {} {:02X}{:02X}{:02X}\n", 
-                    descriptor.x + line, 
-                    descriptor.y + px_y, 
-                    pixel.data[0], 
-                    pixel.data[1], 
-                    pixel.data[2],
-                )
-                    .expect("can always write to vec");
-            }
-        }
-
-        v
-    }).collect()
-}
-
-struct Work(Vec<u8>);
 
 // run a worker with a command receiver.
-fn worker<'a>(screen: SocketAddr, rx: &'a std_mpsc::Receiver<Work>) -> impl Future<Item=(),Error=io::Error> + 'a {
+fn worker<'a>(screen: SocketAddr, rx: &'a mut mpsc::UnboundedReceiver<DrawCommand>) -> impl Future<Item=(),Error=io::Error> + 'a {
+    let wait_for_first_work = rx.into_future()
+        .map(|(c, s)| (c.expect("main thread hung up"), s))
+        .map_err(|(e, _)| panic!("main thread never sent work: {:?}", e));
+    
     tokio_tcp::TcpStream::connect(&screen)
-        .and_then(move |stream| {
-            println!("connected to remote");
+        .join(wait_for_first_work)
+        .and_then(move |(stream, (command, rx))| {
+            println!("connected to screen and got first work.");
+
             if let Err(e) = stream.set_nodelay(true) {
                 return future::Either::A(future::err(e));
             }
 
-            // TODO: don't block here...
-            let chunk = match rx.recv() {
-                Ok(Work(chunk)) => chunk,
-                Err(e) => panic!("main thread never sent work: {:?}", e),
-            };
-
             let stream = BufWriter::new(stream);
-            let loop_forever = future::loop_fn((stream, chunk), move |(stream, mut chunk)| {
+            let loop_forever = future::loop_fn((stream, command), move |(stream, mut command)| {
                 // check for new work.
-                match rx.try_recv() {
-                    Ok(Work(new_chunk)) => { chunk = new_chunk },
-                    Err(TryRecvError::Empty) => {},
-                    Err(_) => panic!("main thread hung up."), 
+                match rx.poll() {
+                    Ok(Async::NotReady) => {},
+                    Ok(Async::Ready(None)) | Err(()) => panic!("main thread hung up"),
+                    Ok(Async::Ready(Some(new_command))) => { command = new_command },
                 }
 
-                async_io::write_all(stream, chunk)
-                    .and_then(|(s, chunk)| async_io::flush(s).map(move |s| (s, chunk)))
-                    .map(future::Loop::Continue)
+                command.write_random(stream).map(future::Loop::Continue)
             });
 
             future::Either::B(loop_forever)
         })
 }
 
-#[derive(Clone)]
-struct Worker {
-    commands: std_mpsc::Sender<Work>,
-}
-
-fn with_workers(
+fn work_producer(
     mut x: u32, 
     mut y: u32, 
-    image: &image::RgbImage, 
-    workers: &[Worker], 
-    send_commands: mpsc::UnboundedSender<DrawCommand>
+    image: &image::RgbaImage, 
+    workers: &[mpsc::UnboundedSender<DrawCommand>],
 ) {
     const D_X: u32 = 25;
     const D_Y: u32 = 50;
@@ -176,10 +233,12 @@ fn with_workers(
     let mut stdin = stdin.lock();
 
     loop {
-        let chunks = chunkify_image(&image, x, y, THREADS);
-        let _ = send_commands.unbounded_send(DrawCommand { x, y });
-        for (i, chunk) in chunks.into_iter().enumerate().take(THREADS as _) {
-            let _ = workers[i].commands.send(Work(chunk));
+        let chunks = chunkify_image(x, y, &image);
+        let command = DrawCommand { data: Arc::new(chunks) };
+
+        // relay to workers.
+        for worker in workers {
+            let _ = worker.unbounded_send(command.clone());
         }
 
         let mut buf = [0u8];
@@ -198,12 +257,11 @@ fn with_workers(
     }
 }
 
-struct DrawCommand {
-    x: u32,
-    y: u32,
-}
-
-fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::UnboundedReceiver<DrawCommand>, port: u16) -> impl Future<Item=(),Error=()> {
+fn run_server(
+    magic: [u8; 16], 
+    new_commands: mpsc::UnboundedReceiver<DrawCommand>, 
+    port: u16,
+) -> impl Future<Item=(),Error=()> {
     type BoxEmptyFut = Box<dyn Future<Item=(),Error=()>>;
 
     enum Event<S> {
@@ -225,11 +283,10 @@ fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::Unbou
     let send_work = sink_rx.select(new_commands.map(Event::Draw)).for_each(move |event| match event {
         Event::NewSink(sink) => {
             if let Some(ref cmd) = last_command {
-                let chunks = chunkify_image(&image, cmd.x, cmd.y, sink.n_workers());
                 let sinks = sinks.clone();
                 println!("Sending work to new connection");
                 Box::new(
-                    sink.send(distributed::WorkPackage { data: chunks })
+                    sink.send(cmd.clone())
                         .then(move |res| { match res { 
                                 Ok(sink) => {
                                     sinks.lock().push(sink);
@@ -250,8 +307,7 @@ fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::Unbou
         Event::Draw(command) => {
             println!("Sending work to all connections");
 
-            last_command = Some(command);
-            let cmd = last_command.as_ref().expect("just set; qed");
+            last_command = Some(command.clone());
 
             // send to all sinks.
             // if it succeeds we add again to the buffer.
@@ -260,10 +316,9 @@ fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::Unbou
                 std::mem::replace(&mut *sinks, Vec::new())
             };
 
-            let work: Vec<_> = last_sinks.into_iter().map(|sink| {
-                let chunks = chunkify_image(&image, cmd.x, cmd.y, sink.n_workers());
-                sink.send(distributed::WorkPackage { data: chunks })
-            }).collect();
+            let work: Vec<_> = last_sinks.into_iter()
+                .map(|sink| sink.send(command.clone()))
+                .collect();
 
             let sinks = sinks.clone();
             Box::new(stream::futures_unordered(work)
@@ -280,8 +335,8 @@ fn run_server(magic: [u8; 16], image: image::RgbImage, new_commands: mpsc::Unbou
 }
 
 fn main() {
-    // local workers.
-    let mut workers = Vec::new();
+    // local and potentially remote workers.
+    let mut worker_handles = Vec::new();
 
     let screen: SocketAddr = std::env::var("SCREEN").ok()
         .unwrap_or_else(|| BIG_SCREEN.to_string())
@@ -289,15 +344,15 @@ fn main() {
         .unwrap();
 
     for i in 0..THREADS {
-        let (tx, rx) = std_mpsc::channel();
+        let (tx, mut rx) = mpsc::unbounded();
 
         thread::spawn(move || loop {
-            if let Err(e) = worker(screen, &rx).wait() {
+            if let Err(e) = worker(screen, &mut rx).wait() {
                 println!("Restarting thread {}: {:?}", i, e);   
             }
         });
 
-        workers.push(Worker { commands: tx });
+        worker_handles.push(tx);
     }
 
     let magic = {
@@ -313,12 +368,13 @@ fn main() {
 
     match std::env::var("REMOTE").ok() {
         Some(addr) => {
-            distributed::client(addr.parse().expect("invalid multiaddr"), magic, THREADS)
+            distributed::client(addr.parse().expect("invalid multiaddr"), magic)
                 .and_then(move |work_stream| {
                     work_stream.for_each(move |work| {
-                        println!("Got work with {} parts from server.", work.data.len());
-                        for (i, chunk) in work.data.into_iter().enumerate().take(workers.len()) {
-                            let _ = workers[i].commands.send(Work(chunk));
+                        println!("Got work with {} parts from server.", work.valid_offsets.len());
+                        let command = DrawCommand::from_chunked(work);
+                        for worker in &worker_handles {
+                            let _ = worker.unbounded_send(command.clone());
                         }
                         Ok(())
                     })
@@ -327,18 +383,20 @@ fn main() {
                 .unwrap();
         }
         None => {
+            // add remote workers.
+            let (remote_tx, remote_rx) = mpsc::unbounded();
+            worker_handles.push(remote_tx);
+
             let port: u16 = std::env::var("PORT").ok().map(|s| s.parse().unwrap()).unwrap_or(0);
 
             let img_path = std::env::var("IMG_PATH").expect("Set IMG_PATH env var");
-            let image = image::open(img_path.as_str()).expect("provide valid image").to_rgb();
-            let (cmd_tx, cmd_rx) = mpsc::unbounded();
+            let image = image::open(img_path.as_str()).expect("provide valid image").to_rgba();
 
-            let workers_img = image.clone();
             std::thread::spawn(move || 
-                with_workers(0, 0, &workers_img, &workers[..], cmd_tx)
+                work_producer(0, 0, &image, &worker_handles[..])
             );
 
-            run_server(magic, image, cmd_rx, port).wait().unwrap();
+            run_server(magic, remote_rx, port).wait().unwrap();
         }
     }
 }

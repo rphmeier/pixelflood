@@ -14,3 +14,4 @@ byteorder = "1.0"
 parking_lot = "0.7"
 tokio-tcp = "0.1"
 libp2p = { git = "https://github.com/libp2p/rust-libp2p" }
+rand = "0.6"

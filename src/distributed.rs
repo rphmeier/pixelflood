@@ -9,6 +9,7 @@ use libp2p::tcp::TcpConfig;
 use libp2p::tokio_io::{io, AsyncRead, AsyncWrite};
 use futures::prelude::*;
 use byteorder::{ByteOrder, LittleEndian};
+use crate::{Chunked, DrawCommand};
 
 fn dial_secure(addr: Multiaddr) -> impl Future<Item = impl AsyncRead + AsyncWrite,Error=IoError> {
     let transport = TcpConfig::new()
@@ -43,12 +44,6 @@ fn listen_secure(addr: Multiaddr) -> impl Stream<Item = impl AsyncRead + AsyncWr
     })
 }
 
-/// Vector of draw commands.
-pub struct WorkPackage {
-    /// The draw commands.
-    pub data: Vec<Vec<u8>>,
-}
-
 #[derive(Debug)]
 pub enum Error {
     Io(IoError),
@@ -62,39 +57,34 @@ impl From<IoError> for Error {
     }
 }
 
-/// A sink for a buffer over a remote connection.
-pub struct BufSink<T: 'static> {
-    n_workers: u32,
-    state: BufSinkState<T>,
+/// A sink for a command over a remote connection.
+pub(crate) struct CommandSink<T: 'static> {
+    state: CommandSinkState<T>,
 }
 
-enum BufSinkState<T: 'static> {
+enum CommandSinkState<T: 'static> {
     Ready(T),
     Writing(Box<Future<Item=T,Error=IoError>>),
     Empty,
 }
 
-impl<T: 'static> BufSink<T> {
-    /// The number of workers.
-    pub fn n_workers(&self) -> u32 { self.n_workers }
-}
-
-impl<T: 'static> Sink for BufSink<T> 
+impl<T: 'static> Sink for CommandSink<T> 
     where T: AsyncWrite,
 {
-    type SinkItem = WorkPackage;
+    type SinkItem = DrawCommand;
     type SinkError = IoError;
 
-    fn start_send(&mut self, item: WorkPackage) -> StartSend<WorkPackage, IoError> {
-        match mem::replace(&mut self.state, BufSinkState::Empty) {
-            BufSinkState::Ready(s) => {
+    fn start_send(&mut self, item: DrawCommand) -> StartSend<DrawCommand, IoError> {
+        match mem::replace(&mut self.state, CommandSinkState::Empty) {
+            CommandSinkState::Ready(s) => {
                 const MAX_BUFFER: usize = 6 * 1024 * 1024;
 
-                let size = bincode::serialized_size(&item.data).expect("can serialize bytes");
+                let inner = item.chunked_data();
+                let size = bincode::serialized_size(&inner).expect("can serialize bytes");
 
                 let mut buf = vec![0; 4 + size as usize];
                 LittleEndian::write_u32(&mut buf[..4], size as u32);
-                bincode::serialize_into(&mut buf[4..], &item.data).expect("can serialize bytes");
+                bincode::serialize_into(&mut buf[4..], &inner).expect("can serialize bytes");
 
                 // write while flushing periodically to avoid running into buffer issues.
                 let write_chunked = future::loop_fn((s, buf), |(s, mut buf)| {
@@ -109,7 +99,7 @@ impl<T: 'static> Sink for BufSink<T>
                     }
                 });
 
-                self.state = BufSinkState::Writing(Box::new(write_chunked));
+                self.state = CommandSinkState::Writing(Box::new(write_chunked));
                 Ok(AsyncSink::Ready)
             }
             other => {
@@ -124,14 +114,14 @@ impl<T: 'static> Sink for BufSink<T>
     }
 
     fn poll_complete(&mut self) -> Poll<(), IoError> {
-        match mem::replace(&mut self.state, BufSinkState::Empty) {
-            BufSinkState::Writing(mut work) => match work.poll()? {
+        match mem::replace(&mut self.state, CommandSinkState::Empty) {
+            CommandSinkState::Writing(mut work) => match work.poll()? {
                 Async::NotReady => {
-                    self.state = BufSinkState::Writing(work);
+                    self.state = CommandSinkState::Writing(work);
                     Ok(Async::NotReady)
                 }
                 Async::Ready(w) => {
-                    self.state = BufSinkState::Ready(w);
+                    self.state = CommandSinkState::Ready(w);
                     Ok(Async::Ready(()))
                 }
             }
@@ -148,7 +138,7 @@ impl<T: 'static> Sink for BufSink<T>
 }
 
 /// Listen on server.
-pub fn listen(addr: Multiaddr, magic: [u8; 16]) -> impl Stream<Item=BufSink<impl AsyncWrite>, Error=Error> {
+pub fn listen(addr: Multiaddr, magic: [u8; 16]) -> impl Stream<Item=CommandSink<impl AsyncWrite>, Error=Error> {
     listen_secure(addr)
         .map_err(Into::into)
         .and_then(move |conn| {
@@ -157,20 +147,17 @@ pub fn listen(addr: Multiaddr, magic: [u8; 16]) -> impl Stream<Item=BufSink<impl
 
             io::write_all(write, magic)
                 .and_then(|(w, _)| io::flush(w))
-                .and_then(move |w| io::read_exact(read, [0u8; 20])
+                .and_then(move |w| io::read_exact(read, [0u8; 16])
                     .map(move |(a, b)| (a, b, w))
                 )
                 .map_err(Into::into)
-                .map(move |(_read, handshake, write)| {
-                    let received_magic = &handshake[0..16];
-                    let n_workers = LittleEndian::read_u32(&handshake[16..]);
-
+                .map(move |(_read, received_magic, write)| {
                     if received_magic != &magic[..] {
                         println!("Rejecting client: bad magic number");
                         None
                     } else {
-                        println!("Handshook connection with {} workers", n_workers);
-                        Some(BufSink { n_workers, state: BufSinkState::Ready(write) })
+                        println!("Handshook connection");
+                        Some(CommandSink { state: CommandSinkState::Ready(write) })
                     }
                 })
                 .then(|res: Result<_, Error>| match res {
@@ -185,7 +172,7 @@ pub fn listen(addr: Multiaddr, magic: [u8; 16]) -> impl Stream<Item=BufSink<impl
 }
 
 /// Connect to server as client. Provide given magic number to compare against the server.
-pub fn client(addr: Multiaddr, magic: [u8; 16], n_workers: u32) -> impl Future<Item=impl Stream<Item=WorkPackage,Error=Error>, Error=Error> {
+pub fn client(addr: Multiaddr, magic: [u8; 16]) -> impl Future<Item=impl Stream<Item=Chunked,Error=Error>, Error=Error> {
     dial_secure(addr)
         .map(|conn| conn.split())
         .map(|(read, write)| (BufReader::new(read), write)) 
@@ -198,10 +185,7 @@ pub fn client(addr: Multiaddr, magic: [u8; 16], n_workers: u32) -> impl Future<I
                 println!("Mismatch: server had different magic number");
                 Err(Error::BadMagic)
             } else {
-                let mut handshake = [0u8; 20];
-                handshake[0..16].copy_from_slice(&magic);
-                LittleEndian::write_u32(&mut handshake[16..20], n_workers);
-                Ok(io::write_all(write, handshake).map(move |(w, _)| (read, w)))
+                Ok(io::write_all(write, magic).map(move |(w, _)| (read, w)))
             }
         })
         .and_then(|write_all| write_all.map_err(Into::into))
@@ -216,7 +200,7 @@ pub fn client(addr: Multiaddr, magic: [u8; 16], n_workers: u32) -> impl Future<I
                     })
                     .map_err(Into::into)
                     .and_then(|(read, buf)| match bincode::deserialize(&buf) {
-                        Ok(data) => Ok((WorkPackage { data }, read)),
+                        Ok(data) => Ok((data, read)),
                         Err(e) => Err(Error::BadPayload(e)),
                     });
 
