@@ -28,6 +28,7 @@ const BIG_SCREEN: &str = "151.217.40.82:1234";
 
 const THREADS: u32 = 10;
 
+#[derive(Debug)]
 struct ChunkDescriptor {
     x: u32,
     y: u32,
@@ -43,7 +44,7 @@ fn chunks(width: u32, height: u32, n: u32) -> impl Iterator<Item=ChunkDescriptor
 
         ChunkDescriptor {
             x: line_off,
-            y: height,
+            y: 0,
             width: lines_per,
             height,
         }
@@ -57,21 +58,21 @@ fn chunkify_square(x: u32, y: u32, size: u32, rgb: u32, n: u32) -> Vec<Vec<u8>> 
     chunks(size, size, n).map(|descriptor| {
         let mut v = Vec::new();
 
-        write!(
-            &mut v,
-            "OFFSET {} {}\n",
-            x,
-            y
-        )
-            .expect("can always write to vec");
+        // write!(
+        //     &mut v,
+        //     "OFFSET {} {}\n",
+        //     x,
+        //     y
+        // )
+        //     .expect("can always write to vec");
 
         for line in 0..descriptor.width {
             for px_y in 0..descriptor.height {
                 write!(
                     &mut v, 
                     "PX {} {} {:06X}\n", 
-                    descriptor.x + line,
-                    descriptor.y + px_y, 
+                    x + descriptor.x + line,
+                    y + descriptor.y + px_y, 
                     rgb,
                 )
                     .expect("can always write to vec");
@@ -89,23 +90,25 @@ fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8
     chunks(w, h, n).map(|descriptor| {
         let mut v = Vec::new();
 
-        write!(
-            &mut v,
-            "OFFSET {} {}\n",
-            x,
-            y
-        )
-            .expect("can always write to vec");
+        println!("writing pixels for chunk {:?}", descriptor);
+
+        // write!(
+        //     &mut v,
+        //     "OFFSET {} {}\n",
+        //     x,
+        //     y
+        // )
+        //     .expect("can always write to vec");
 
         for line in 0..descriptor.width {
             for px_y in 0..descriptor.height {
-                let pixel = image.get_pixel(line, px_y);
+                let pixel = image.get_pixel(descriptor.x + line, descriptor.y + px_y);
 
                 write!(
                     &mut v, 
                     "PX {} {} {:02X}{:02X}{:02X}\n", 
-                    descriptor.x + line, 
-                    descriptor.y + px_y, 
+                    x + descriptor.x + line, 
+                    y + descriptor.y + px_y, 
                     pixel.data[0], 
                     pixel.data[1], 
                     pixel.data[2],
@@ -123,7 +126,8 @@ struct Work(Vec<u8>);
 // run a worker with a command receiver.
 fn worker(screen: SocketAddr, rx: &std_mpsc::Receiver<Work>) -> io::Result<()> {
     let stream = TcpStream::connect(screen)?;
-    stream.set_nonblocking(true)?;
+    println!("connected to remote");
+    //stream.set_nonblocking(true)?;
     stream.set_nodelay(true)?;
 
     let mut stream = BufWriter::new(stream);
@@ -335,7 +339,7 @@ fn main() {
 
             let workers_img = image.clone();
             std::thread::spawn(move || 
-                with_workers(400, 400, &workers_img, &workers[..], cmd_tx)
+                with_workers(0, 0, &workers_img, &workers[..], cmd_tx)
             );
 
             run_server(magic, image, cmd_rx, port).wait().unwrap();
