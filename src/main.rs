@@ -92,13 +92,13 @@ fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8
 
         println!("writing pixels for chunk {:?}", descriptor);
 
-        // write!(
-        //     &mut v,
-        //     "OFFSET {} {}\n",
-        //     x,
-        //     y
-        // )
-        //     .expect("can always write to vec");
+        write!(
+            &mut v,
+            "OFFSET {} {}\n",
+            x,
+            y,
+        )
+            .expect("can always write to vec");
 
         for line in 0..descriptor.width {
             for px_y in 0..descriptor.height {
@@ -107,8 +107,8 @@ fn chunkify_image(image: &image::RgbImage, x: u32, y: u32, n: u32) -> Vec<Vec<u8
                 write!(
                     &mut v, 
                     "PX {} {} {:02X}{:02X}{:02X}\n", 
-                    x + descriptor.x + line, 
-                    y + descriptor.y + px_y, 
+                    descriptor.x + line, 
+                    descriptor.y + px_y, 
                     pixel.data[0], 
                     pixel.data[1], 
                     pixel.data[2],
