@@ -127,7 +127,6 @@ struct Work(Vec<u8>);
 fn worker(screen: SocketAddr, rx: &std_mpsc::Receiver<Work>) -> io::Result<()> {
     let stream = TcpStream::connect(screen)?;
     println!("connected to remote");
-    //stream.set_nonblocking(true)?;
     stream.set_nodelay(true)?;
 
     let mut stream = BufWriter::new(stream);
@@ -145,19 +144,8 @@ fn worker(screen: SocketAddr, rx: &std_mpsc::Receiver<Work>) -> io::Result<()> {
             Err(_) => panic!("main thread hung up."), 
         }
 
-        if let Err(e) = stream.write_all(&chunk[..]) {
-            match e.kind() {
-                io::ErrorKind::WouldBlock => {},
-                _ => return Err(e),
-            }
-        }
-
-        if let Err(e) = stream.flush() {
-            match e.kind() {
-                io::ErrorKind::WouldBlock => {}
-                _ => return Err(e),
-            }
-        }
+        stream.write_all(&chunk[..])?;
+        stream.flush()?;
     }
 }
 
